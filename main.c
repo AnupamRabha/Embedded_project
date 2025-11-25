@@ -1,6 +1,6 @@
-/* main.c
-   Tiva C TM4C123 + MCP4725 simple, CPU-driven sine generator (I2C fast mode)
-   Uses Timer0A ISR to update the DAC at a fixed sample rate.
+/*
+  PWM + RC-filtered Waveform Generator using TM4C123GH6PM
+  Waveforms: SINE, TRIANGLE, SQUARE — switched using SW1 (PF4)
 */
 
 #include <stdint.h>
@@ -8,154 +8,146 @@
 #include <math.h>
 
 #include "inc/hw_memmap.h"
-#include "inc/hw_i2c.h"
+#include "inc/hw_ints.h"
 #include "driverlib/sysctl.h"
-#include "driverlib/i2c.h"
 #include "driverlib/gpio.h"
+#include "driverlib/pwm.h"
 #include "driverlib/pin_map.h"
 #include "driverlib/timer.h"
 #include "driverlib/interrupt.h"
-#include "inc/hw_ints.h"
 
+#define SYSCLK_HZ         50000000UL
+#define PWM_CARRIER_HZ    200000U
+#define TABLE_SIZE        64
+#define SAMPLE_RATE_HZ    64000U  // 1 kHz sine (64 samples/cycle)
 
-#define MCP4725_ADDR       0x60    // A0 = GND -> 0x60 (7-bit address)
-#define TABLE_SIZE         8     // 256-sample sine table
-#define SAMPLE_RATE_HZ     5000    // target sample rate in Hz (adjustable)
-                                  // realistic: try 1k-10k; higher may fail
+// PWM Output
+#define PWM_BASE          PWM0_BASE
+#define PWM_GEN           PWM_GEN_0
+#define PWM_OUT_BIT       PWM_OUT_0_BIT
+#define PWM_OUT_NUM       PWM_OUT_0
+#define PWM_GPIO_PORT     GPIO_PORTB_BASE
+#define PWM_GPIO_PIN      GPIO_PIN_6
+#define PWM_GPIO_CFG      GPIO_PB6_M0PWM0
 
-//static uint16_t sine_table[TABLE_SIZE];      // 12-bit values 0..4095
-static uint8_t  i2c_msb[TABLE_SIZE];         // first data byte for MCP4725 fast write
-static uint8_t  i2c_lsb[TABLE_SIZE];         // second data byte
+// Button (SW1 on PF4)
+#define BUTTON_PORT       GPIO_PORTF_BASE
+#define BUTTON_PIN        GPIO_PIN_4
 
-// --------------------------------------------------------
-// Write 2-bytes to MCP4725 fast write (blocking).
-// We assume Device address already set per-transmission.
-// --------------------------------------------------------
-static inline void MCP4725_WriteBytes(uint8_t msb, uint8_t lsb)
+static uint16_t sine_table[TABLE_SIZE];
+static uint16_t triangle_table[TABLE_SIZE];
+static uint16_t square_table[TABLE_SIZE];
+
+volatile uint8_t waveform_mode = 0; // 0=SINE, 1=TRIANGLE, 2=SQUARE
+
+void BuildTables(uint32_t period_counts)
 {
-    // Set slave address with write (R/W = 0)
-    I2CMasterSlaveAddrSet(I2C0_BASE, MCP4725_ADDR, false);
+    int i;
+    for(i = 0; i < TABLE_SIZE; i++)
+    {
+        // Sine Table
+        float theta = (2.0f * M_PI * i) / TABLE_SIZE;
+        float s = (sinf(theta) + 1.0f) * 0.5f;
+        sine_table[i] = (uint16_t)(s * (period_counts - 2) + 1);
 
-    // Send first data byte (start the burst)
-    I2CMasterDataPut(I2C0_BASE, msb);
-    I2CMasterControl(I2C0_BASE, I2C_MASTER_CMD_BURST_SEND_START);
-    while (I2CMasterBusy(I2C0_BASE)); // blocking; short on 400kHz
+        // Triangle Table
+        int mid = TABLE_SIZE / 2;
+        float t = (i < mid) ?
+            (float)i / mid : (float)(TABLE_SIZE - i) / mid;
+        triangle_table[i] = (uint16_t)(t * (period_counts - 2) + 1);
 
-    // Send second data byte and finish
-    I2CMasterDataPut(I2C0_BASE, lsb);
-    I2CMasterControl(I2C0_BASE, I2C_MASTER_CMD_BURST_SEND_FINISH);
-    while (I2CMasterBusy(I2C0_BASE));
+        // Square Table
+        if(i < (TABLE_SIZE / 2))
+            square_table[i] = (period_counts - 2);
+        else
+            square_table[i] = 1;
+    }
 }
 
-// --------------------------------------------------------
-// Timer0A ISR: send next sample
-// --------------------------------------------------------
+// Button Debounce
+bool ButtonPressed(void)
+{
+    static uint8_t lastState = 1;
+    uint8_t current = GPIOPinRead(BUTTON_PORT, BUTTON_PIN);
+    bool pressed = (current == 0) && (lastState != 0);
+    lastState = current;
+    return pressed;
+}
+
+// Timer ISR
 void Timer0A_Handler(void)
 {
     static uint32_t idx = 0;
 
-    // Clear the timer interrupt
     TimerIntClear(TIMER0_BASE, TIMER_TIMA_TIMEOUT);
 
-    // Write two bytes to the DAC for current sample
-    MCP4725_WriteBytes(i2c_msb[idx], i2c_lsb[idx]);
+    uint16_t duty;
+    if(waveform_mode == 0)
+        duty = sine_table[idx];
+    else if(waveform_mode == 1)
+        duty = triangle_table[idx];
+    else
+        duty = square_table[idx];
 
-    // advance
+    PWMPulseWidthSet(PWM_BASE, PWM_OUT_NUM, duty);
+
     idx++;
-    if (idx >= TABLE_SIZE) idx = 0;
+    if(idx >= TABLE_SIZE) idx = 0;
 }
 
-// --------------------------------------------------------
-// I2C0 initialization (PB2=SCL, PB3=SDA) at 400 kHz
-// --------------------------------------------------------
-void I2C0_Init(void)
-{
-    SysCtlPeripheralEnable(SYSCTL_PERIPH_I2C0);
-    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
-
-    // Configure pin muxing for I2C0 functions on PB2/PB3
-    GPIOPinConfigure(GPIO_PB2_I2C0SCL);
-    GPIOPinConfigure(GPIO_PB3_I2C0SDA);
-
-    // Configure pin types
-    GPIOPinTypeI2CSCL(GPIO_PORTB_BASE, GPIO_PIN_2);
-    GPIOPinTypeI2C(GPIO_PORTB_BASE, GPIO_PIN_3);
-
-    // Initialize the I2C master at 400 kHz (fast mode)
-    I2CMasterInitExpClk(I2C0_BASE, SysCtlClockGet(), true); // true -> 400kHz
-}
-
-// --------------------------------------------------------
-// Build sine table (12-bit, 0..4095) and precompute bytes
-// For MCP4725 fast mode we pack the 12-bit data into two bytes.
-// Many implementations send:
-//   msb = (value >> 8) & 0x0F;           // upper 4 bits (D11..D8) in lower nibble
-//   lsb = value & 0xFF;                  // lower 8 bits
-// That works with MCP4725 fast write (address then 2 data bytes).
-// --------------------------------------------------------
-void BuildSineTable(void)
-{   int i;
-    for (i = 0; i < TABLE_SIZE; i++)
-    {
-        float theta = (2.0f * M_PI * i) / (float)TABLE_SIZE;
-        float s = (sinf(theta) + 1.0f) * 2047.0f; // 0..4094
-        uint16_t val = (uint16_t)(s + 0.5f);
-        if (val > 4095) val = 4095;
-
-        // Precompute the two DAC bytes directly
-        i2c_msb[i] = (val >> 8) & 0x0F;
-        i2c_lsb[i] = val & 0xFF;
-    }
-}
-
-// --------------------------------------------------------
-// Timer0A init to fire at SAMPLE_RATE_HZ (periodic interrupt)
-// --------------------------------------------------------
-void Timer0A_Init(uint32_t sample_rate_hz)
-{
-    SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER0);
-    TimerDisable(TIMER0_BASE, TIMER_A);
-
-    // Configure as 32-bit periodic timer
-    TimerConfigure(TIMER0_BASE, TIMER_CFG_PERIODIC);
-
-    // compute load for desired rate
-    uint32_t load = SysCtlClockGet() / sample_rate_hz;
-    if (load == 0) load = 1;
-    TimerLoadSet(TIMER0_BASE, TIMER_A, load - 1);
-
-    // Enable interrupt
-    IntRegister(INT_TIMER0A, Timer0A_Handler); // alternative: use weak vector if you prefer
-    TimerIntEnable(TIMER0_BASE, TIMER_TIMA_TIMEOUT);
-    IntEnable(INT_TIMER0A);
-
-    // Start timer
-    TimerEnable(TIMER0_BASE, TIMER_A);
-}
-
-// --------------------------------------------------------
-// Main
-// --------------------------------------------------------
 int main(void)
 {
-    // Set system clock: 50 MHz using PLL with 16 MHz crystal (common TM4C123 config)
     SysCtlClockSet(
         SYSCTL_USE_PLL | SYSCTL_OSC_MAIN | SYSCTL_SYSDIV_4 | SYSCTL_XTAL_16MHZ);
 
-    // Initialize I2C and sine table
-    I2C0_Init();
-    BuildSineTable();
+    uint32_t sysclk = SysCtlClockGet();
+    uint32_t pwmPeriodCounts = sysclk / PWM_CARRIER_HZ;
 
-    // Small delay to let I2C lines settle / device power-up
-    SysCtlDelay(SysCtlClockGet() / 10);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_PWM0);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER0);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
 
-    // Initialize timer ISR for the sample rate
-    Timer0A_Init(SAMPLE_RATE_HZ);
+    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_PWM0));
+    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_TIMER0));
+    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOB));
+    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOF));
 
-    // Main does nothing: waveform produced in ISR
-    while (1)
+    // PWM Pin Setup
+    GPIOPinConfigure(PWM_GPIO_CFG);
+    GPIOPinTypePWM(PWM_GPIO_PORT, PWM_GPIO_PIN);
+    SysCtlPWMClockSet(SYSCTL_PWMDIV_1);
+    PWMGenConfigure(PWM_BASE, PWM_GEN, PWM_GEN_MODE_DOWN);
+    PWMGenPeriodSet(PWM_BASE, PWM_GEN, pwmPeriodCounts);
+
+    BuildTables(pwmPeriodCounts);
+    PWMPulseWidthSet(PWM_BASE, PWM_OUT_NUM, sine_table[0]);
+
+    PWMOutputState(PWM_BASE, PWM_OUT_BIT, true);
+    PWMGenEnable(PWM_BASE, PWM_GEN);
+
+    // Button PF4 (pull-up)
+    GPIOPinTypeGPIOInput(BUTTON_PORT, BUTTON_PIN);
+    GPIOPadConfigSet(BUTTON_PORT, BUTTON_PIN,
+        GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+
+    // Timer Init
+    TimerConfigure(TIMER0_BASE, TIMER_CFG_PERIODIC);
+    TimerLoadSet(TIMER0_BASE, TIMER_A, sysclk / SAMPLE_RATE_HZ - 1);
+
+    IntRegister(INT_TIMER0A, Timer0A_Handler);
+    TimerIntEnable(TIMER0_BASE, TIMER_TIMA_TIMEOUT);
+    IntEnable(INT_TIMER0A);
+    TimerEnable(TIMER0_BASE, TIMER_A);
+
+    while(1)
     {
-        // optional: put MCU to sleep until next interrupt to save power
-        // __asm("WFI");  // if you want to use Wait for Interrupt
+        if(ButtonPressed())
+        {
+            waveform_mode++;
+            if(waveform_mode > 2)
+                waveform_mode = 0;
+            SysCtlDelay(sysclk / 8); // simple debounce delay
+        }
     }
 }
